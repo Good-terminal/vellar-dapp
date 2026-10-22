@@ -171,6 +171,14 @@ export interface WalletServiceDeps {
     get?(recordId: string): Promise<WalletJobRecord | undefined> | WalletJobRecord | undefined;
     updateStatus?(recordId: string, status: JobStatus): Promise<void> | void;
   };
+  /** Base URL for verification-service (defaults to process.env.VERIFICATION_SERVICE_URL ?? "http://localhost:4002"). */
+  verificationServiceUrl?: string;
+  /** Verification lookup client seam for testing or in-process verification. */
+  verificationClient?: {
+    getStatus(contractId: string): Promise<{ status: string }>;
+  };
+  /** In-memory or persistent store for signer set versions for OCC guard (Issue #509). */
+  signerVersions?: Map<string, number>;
 }
 
 export function buildServer(deps: WalletServiceDeps): FastifyInstance {
@@ -182,6 +190,7 @@ export function buildServer(deps: WalletServiceDeps): FastifyInstance {
   const inFlightTracker = deps.inFlightTracker ?? createMemoryInFlightTracker();
   const now = deps.now ?? (() => new Date());
   const { submitter } = deps;
+  const signerVersions = deps.signerVersions ?? new Map<string, number>();
 
   const memorySubmissionDedup = new Map<string, { hash: string }>();
   const submissionDedup: SubmissionDedupStore = deps.submissionDedup ?? {
@@ -741,7 +750,6 @@ export function buildServer(deps: WalletServiceDeps): FastifyInstance {
       return reply.code(401).send({ error: "unauthorized" });
     }
     return reply.send({ sessions: await sessions.listByContract(contractId, network, now()) });
-
   });
 
   // Cursor-paginated transaction history for an account (issue #256). Same
@@ -834,17 +842,73 @@ export function buildServer(deps: WalletServiceDeps): FastifyInstance {
   });
 
   // Policy update sensitive action endpoint
+  // Issue #513: reject policy updates referencing an unverified contract ID
   app.post("/wallet/policy/update", async (request, reply) => {
     const session = await resolveSessionCapability(request);
     if (!session) return reply.code(401).send({ error: "unauthorized" });
 
     const schema = z.object({
       policyId: z.string().min(1),
+      contractId: z.string().min(1).optional(),
       rules: z.record(z.string(), z.unknown()).optional(),
     });
     const parsed = schema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: "invalid_body", details: parsed.error.issues });
+    }
+
+    const referencedContractId =
+      parsed.data.contractId ??
+      (typeof parsed.data.rules?.contractId === "string"
+        ? parsed.data.rules.contractId
+        : undefined) ??
+      (typeof parsed.data.rules?.targetContractId === "string"
+        ? parsed.data.rules.targetContractId
+        : undefined);
+
+    if (referencedContractId) {
+      let isVerified = false;
+      try {
+        if (deps.verificationClient) {
+          const res = await deps.verificationClient.getStatus(referencedContractId);
+          isVerified = res?.status === "verified";
+        } else {
+          const baseUrl =
+            deps.verificationServiceUrl ??
+            process.env.VERIFICATION_SERVICE_URL ??
+            "http://localhost:4002";
+          const res = await fetch(
+            `${baseUrl}/verification/${encodeURIComponent(referencedContractId)}/status`,
+          );
+          if (!res.ok) {
+            if (res.status === 404) {
+              isVerified = false;
+            } else {
+              return reply.code(503).send({
+                error: "verification_service_unavailable",
+                message: `Verification service returned ${res.status}`,
+              });
+            }
+          } else {
+            const data = (await res.json()) as { status?: string };
+            isVerified = data?.status === "verified";
+          }
+        }
+      } catch (err) {
+        request.log.error(err, "failed to reach verification service");
+        return reply.code(503).send({
+          error: "verification_service_unavailable",
+          message: `Verification service is unreachable while checking contract ${referencedContractId}`,
+        });
+      }
+
+      if (!isVerified) {
+        return reply.code(400).send({
+          error: "unverified_contract",
+          message: `Referenced contract ${referencedContractId} has no verification record or is unverified`,
+          contractId: referencedContractId,
+        });
+      }
     }
 
     await audit.record(
@@ -854,6 +918,8 @@ export function buildServer(deps: WalletServiceDeps): FastifyInstance {
         network: session.network,
         policyId: parsed.data.policyId,
         rules: parsed.data.rules ?? {},
+        contractIdRef: referencedContractId,
+        actor: "policy",
       },
       session.contractId,
     );
@@ -922,6 +988,7 @@ export function buildServer(deps: WalletServiceDeps): FastifyInstance {
         sourceContractId: session.contractId,
         destinationContractId: parsed.data.destinationContractId,
         network: session.network,
+        actor: "passkey",
         plan,
       },
       session.contractId,
@@ -962,6 +1029,7 @@ export function buildServer(deps: WalletServiceDeps): FastifyInstance {
         oldKeyId: parsed.data.oldKeyId,
         newKeyId: parsed.data.newKeyId,
         network: session.network,
+        actor: "passkey",
       },
       session.contractId,
     );
@@ -1023,6 +1091,7 @@ export function buildServer(deps: WalletServiceDeps): FastifyInstance {
         contractId: session.contractId,
         threshold,
         network: session.network,
+        actor: "passkey",
       },
       session.contractId,
     );
@@ -1031,6 +1100,12 @@ export function buildServer(deps: WalletServiceDeps): FastifyInstance {
   });
 
   // Signer add/remove sensitive action endpoint
+  // Issue #509: Concurrency guard against two simultaneous signer-set mutations racing
+  // Client retry contract:
+  // When receiving a 409 Conflict (code: "signer_version_conflict"):
+  // 1. Fetch the latest signer set and note the updated version/sequence.
+  // 2. Re-compute the planned mutation against the updated signer set.
+  // 3. Retry POST /wallet/signer/manage providing the latest version as `expectedVersion` or `version`.
   app.post("/wallet/signer/manage", async (request, reply) => {
     const session = await resolveSessionCapability(request);
     if (!session) return reply.code(401).send({ error: "unauthorized" });
@@ -1039,11 +1114,31 @@ export function buildServer(deps: WalletServiceDeps): FastifyInstance {
       action: z.enum(["add", "remove"]),
       signerKey: z.string().min(1),
       weight: z.number().optional(),
+      version: z.number().int().nonnegative().optional(),
+      expectedVersion: z.number().int().nonnegative().optional(),
+      sequence: z.number().int().nonnegative().optional(),
+      signerType: z.enum(["passkey", "device", "policy"]).optional(),
+      actor: z.enum(["passkey", "device", "policy"]).optional(),
     });
     const parsed = schema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: "invalid_body", details: parsed.error.issues });
     }
+
+    const currentVersion = signerVersions.get(session.contractId) ?? 0;
+    const expected = parsed.data.expectedVersion ?? parsed.data.version ?? parsed.data.sequence;
+
+    if (expected !== undefined && expected !== currentVersion) {
+      return reply.code(409).send({
+        error: "conflict",
+        code: "signer_version_conflict",
+        message: `Signer set has been modified concurrently. Expected version ${expected}, but current version is ${currentVersion}. Refresh the signer set and retry with updated version.`,
+        currentVersion,
+      });
+    }
+
+    const newVersion = currentVersion + 1;
+    signerVersions.set(session.contractId, newVersion);
 
     const eventType = parsed.data.action === "add" ? "signer.added" : "signer.removed";
     await audit.record(
@@ -1053,20 +1148,68 @@ export function buildServer(deps: WalletServiceDeps): FastifyInstance {
         signerKey: parsed.data.signerKey,
         weight: parsed.data.weight,
         network: session.network,
+        version: newVersion,
+        actor: parsed.data.actor ?? parsed.data.signerType ?? "device",
       },
       session.contractId,
     );
 
-    return reply.send({ status: "signer_updated", action: parsed.data.action });
+    return reply.send({
+      status: "signer_updated",
+      action: parsed.data.action,
+      version: newVersion,
+    });
   });
 
   // Audit logs query endpoint
+  // Issue #512: actor-based filtering (passkey vs device vs policy)
   app.get("/wallet/audit-logs", async (request, reply) => {
     const session = await resolveSessionCapability(request);
     if (!session) return reply.code(401).send({ error: "unauthorized" });
 
+    const query = request.query as { actor?: string };
+    const actor = query.actor;
+
+    if (actor !== undefined) {
+      const validActors = ["passkey", "device", "policy"];
+      if (!validActors.includes(actor)) {
+        return reply.code(400).send({
+          error: "invalid_actor",
+          message: `Invalid actor filter: must be passkey, device, or policy. Received: ${actor}`,
+        });
+      }
+    }
+
     const logs = await audit.list({ actor: session.contractId });
-    return reply.send({ auditLogs: logs });
+    if (!actor) {
+      return reply.send({ auditLogs: logs });
+    }
+
+    const filtered = logs.filter((e) => {
+      // 1. Check explicit actor on data or record actor
+      const explicitActor = e.data?.actor ?? e.data?.signerType ?? e.data?.actorType;
+      if (explicitActor === actor) return true;
+      if (e.actor === actor) return true;
+
+      // 2. Inferred actor by action type if not explicitly set
+      if (!explicitActor || explicitActor === e.actor) {
+        if (actor === "policy" && e.type.startsWith("policy.")) return true;
+        if (actor === "device" && (e.type.startsWith("session.") || e.type.startsWith("signer.")))
+          return true;
+        if (
+          actor === "passkey" &&
+          (e.type.startsWith("wallet.") ||
+            e.type.startsWith("key.") ||
+            e.type.startsWith("threshold.") ||
+            e.type.startsWith("account."))
+        ) {
+          return true;
+        }
+      }
+      return false;
+    });
+
+    return reply.send({ auditLogs: filtered });
   });
 
   return app;
