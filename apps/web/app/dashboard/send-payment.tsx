@@ -12,6 +12,7 @@ import { walletErrorMessage } from "@/lib/messages";
 import { trackTransaction } from "@/lib/track";
 import { usePaymentClient } from "@/lib/wallet-context";
 import { getSupportedTokens, parseAmountWithDecimals, TESTNET_NATIVE_SAC } from "@/lib/tokens";
+import { isMemoRequiredDestination } from "@/lib/memo-destinations";
 
 // Send flow (technical-doc.md §7.4): build -> explicit review -> passkey sign
 // -> submit -> track until final. Signing only ever happens from the review
@@ -47,6 +48,7 @@ export function knownBalance(token: SendableToken, tokens: SendableToken[]): big
 const formSchema = z.object({
   to: z.string().trim().min(1, "Recipient is required"),
   amount: z.string().trim().min(1, "Amount is required"),
+  memo: z.string().trim().optional(),
 });
 
 type FormValues = z.infer<typeof formSchema>;
@@ -93,7 +95,7 @@ export function SendPayment({
 
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
-    defaultValues: { to: prefill?.to ?? "", amount: prefill?.amount ?? "" },
+    defaultValues: { to: prefill?.to ?? "", amount: prefill?.amount ?? "", memo: "" },
   });
 
   /** Inline pre-signing check against the locally known balance. Returns true
@@ -221,6 +223,18 @@ export function SendPayment({
               <span className="ferror">{form.formState.errors.amount.message}</span>
             )}
           </label>
+          <label className="lpa-field">
+            <span className="flabel">Memo (optional)</span>
+            <input
+              {...form.register("memo")}
+              placeholder="Memo or destination tag"
+            />
+          </label>
+          {showMemoWarning && (
+            <p role="alert" className="lpa-bad text-xs" data-testid="memo-warning">
+              Warning: This destination requires a memo (destination tag). Sending without a memo may result in lost funds.
+            </p>
+          )}
           <LpActionButton
             type="submit"
             disabled={form.formState.isSubmitting}
@@ -236,6 +250,11 @@ export function SendPayment({
           <span className="lpa-ok self-start text-[13px] font-bold">
             ✓ Review before signing — this cannot be undone
           </span>
+          {isMemoRequiredDestination(flow.prepared.review.to) && (!memoValue || memoValue.trim() === "") && (
+            <p role="alert" className="lpa-bad text-xs" data-testid="review-memo-warning">
+              Warning: This destination requires a memo (destination tag). Sending without a memo may result in lost funds.
+            </p>
+          )}
           <dl className="lpa-well flex flex-col gap-2.5 text-sm">
             {(
               [
@@ -245,6 +264,7 @@ export function SendPayment({
                 ["From", flow.prepared.review.from],
                 ["To", flow.prepared.review.to],
                 ["Token contract", flow.prepared.review.token.contractId],
+                ...(memoValue && memoValue.trim() ? ([["Memo", memoValue.trim()]] as const) : []),
                 ...(request?.msg ? ([["Message", request.msg]] as const) : []),
               ] as const
             ).map(([label, value]) => (
